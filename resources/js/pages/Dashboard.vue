@@ -1,59 +1,60 @@
 <script setup lang="ts">
-import { Head } from '@inertiajs/vue3';
-import { Image } from '@lucide/vue';
+import { Head, usePoll } from '@inertiajs/vue3';
+import { watch } from 'vue';
+import GenerationForm from '@/components/GenerationForm.vue';
+import GenerationHistory from '@/components/GenerationHistory.vue';
 import { dashboard } from '@/routes';
+import type { GenerationPage } from '@/types/generation';
 
-defineProps<{
+const props = defineProps<{
     title: string;
+    canGenerate: boolean;
+    generations: GenerationPage;
 }>();
 
+const poll = usePoll(3000, { only: ['generations'] }, { autoStart: false });
+
+watch(
+    () =>
+        props.generations.data.some(
+            (generation) =>
+                ['submitting', 'queued', 'processing'].includes(
+                    generation.status,
+                ) && !generation.can_retry,
+        ),
+    (pending) => {
+        if (pending) poll.start();
+        else poll.stop();
+    },
+    { immediate: true },
+);
+
 defineOptions({
-    
     layout: {
-
         breadcrumbs: [
-
             {
-
                 title: 'Dashboard marketplace',
                 href: dashboard(),
             },
-
         ],
-
     },
-
 });
-
 </script>
 
 <template>
     <Head :title="title" />
 
     <div class="flex flex-1 flex-col gap-8 p-6">
-
         <div>
             <h1 class="text-2xl font-semibold tracking-tight">{{ title }}</h1>
             <p class="mt-2 text-sm text-muted-foreground">
                 Track your images and generation costs.
             </p>
-
         </div>
 
-        <section
-            aria-label="Generation history"
-            class="flex min-h-72 flex-col items-center justify-center rounded-xl border border-dashed px-6 py-12 text-center">
-
-            <Image
-                class="mb-4 size-8 text-muted-foreground"
-                aria-hidden="true"/>
-
-            <h2 class="font-medium">No generations yet</h2>
-
-            <p class="mt-2 text-sm text-muted-foreground">
-                Your generated images will appear here.
-            </p>
-
-        </section>
+        <div class="grid items-start gap-6 xl:grid-cols-2">
+            <GenerationForm :can-generate="canGenerate" />
+            <GenerationHistory :generations="generations" />
+        </div>
     </div>
 </template>
