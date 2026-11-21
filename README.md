@@ -2,7 +2,7 @@
 
 A Laravel, Vue, and Inertia application for the PromptEdit product engineering assessment.
 
-Checkpoint 1 provides authentication and PostgreSQL. Checkpoint 2 adds exact pricing. Checkpoint 3 connects Pixelforge to a generation form, background jobs, and live history. Signed webhooks and deployment are the next checkpoints.
+Checkpoint 1 provides authentication and PostgreSQL. Checkpoint 2 adds exact pricing. Checkpoint 3 connects Pixelforge to a generation form, background jobs, and live history. Checkpoint 4 adds signed webhooks and event deduplication. Public deployment is next.
 
 ## Local setup
 
@@ -40,7 +40,7 @@ Stop the development processes with Ctrl+C. `docker compose stop` stops PostgreS
 | ------------------- | ----------------------------------------------------------------------------------------- |
 | Laravel HTTP server | Handles browser requests, authentication, validation, and Inertia responses on port 8000. |
 | Vite                | Serves Vue/CSS assets and reloads changed frontend code during development.               |
-| Queue listener      | Processes database-backed jobs. There are no application jobs in this checkpoint.         |
+| Queue listener      | Submits generations, polls their status, and processes webhook events in the background.  |
 | Pail                | Streams application logs into the terminal.                                               |
 
 `npm run build` produces static assets for serving without Vite. It does not start the application or a queue worker.
@@ -321,4 +321,64 @@ php artisan test tests/Feature/GenerationsTest.php tests/Unit/GenerationPricingT
 
 These tests fake provider HTTP calls and protect against unexpected external requests. They cover validation, quote ownership/expiry, duplicate submission, rate limits, ambiguous timeouts, exact billing, terminal-state protection, and private history.
 
-The next checkpoint adds signed webhook verification, event deduplication, and tests for events arriving twice or out of order. Polling will remain as recovery when a webhook is missed. Local webhook delivery will need a public tunnel and the API key's webhook signing secret. Deployment and reconciliation against `GET /v1/usage` follow afterward.
+## Checkpoint 4: signed webhooks
+
+### 1. Understand delivery and signatures
+
+Polling asks Pixelforge for an update. A webhook is Pixelforge sending an update to us with an HTTP POST. The app now accepts `POST /webhooks/pixelforge` outside Laravel's session and CSRF middleware. It authenticates each request with the API key's webhook signing secret instead.
+
+`VerifyPixelforgeSignature` reads the raw request bytes and verifies the HMAC-SHA256 signature of `timestamp.raw-body`. It uses a constant-time comparison and accepts delivery timestamps within five minutes of the server's clock. The delivery timestamp is checked, not the event's creation time: an old event can be resent with a fresh signature. Signature validation happens before the controller trusts or stores the event.
+
+### 2. Receive once and process in the background
+
+`PixelforgeWebhookController` checks the event shape and status, then saves a receipt in `pixelforge_webhook_events`. A unique database constraint on `event_id` protects against concurrent duplicate deliveries. The signed body's ID is authoritative; delivery headers are not used as a substitute.
+
+The controller dispatches `ProcessPixelforgeWebhook` after the receipt transaction commits, then returns HTTP 204. It does not wait for generation processing or download an image. If delivery repeats, the existing receipt is reused. A processed event is not queued again. An unprocessed receipt can be retried without creating another event row.
+
+### 3. Share finalization with polling
+
+The processing job locks the receipt. It finds our generation using the local UUID in `metadata.generation_id`, falling back to an already saved provider ID. This handles a webhook arriving while the original submission request is still in progress: our local row already exists, and we included its UUID in the provider request.
+
+The job parses the generation using the same parser as API responses and calls `ApplyGenerationResult`. That service locks the generation, preserves terminal states, and records the exact final cost. Receipt completion and generation updates commit together. If processing fails, both roll back; the job has bounded retries, and the receipt retains any final processing error for investigation.
+
+Ping events are recorded and marked processed without changing a generation. Events with no matching local generation are recorded as ignored. Polling continues to recover results when delivery is missed. A late processing event or queued API response cannot rewind a finished generation.
+
+### 4. Configure local provider delivery
+
+Each Pixelforge API key has a separate webhook URL and signing secret. In the local key's dashboard settings, copy the signing secret into the ignored `.env` file:
+
+```dotenv
+PIXELFORGE_WEBHOOK_SECRET=your-local-signing-secret
+```
+
+Then clear cached configuration and keep the development server and queue running:
+
+```bash
+php artisan config:clear
+docker compose up -d --wait
+composer run dev
+```
+
+Pixelforge cannot reach `127.0.0.1`. Use a public HTTPS tunnel, for example the locally installed ngrok CLI:
+
+```bash
+ngrok http http://127.0.0.1:8000
+```
+
+Set the local API key's webhook URL to the tunnel's HTTPS address plus `/webhooks/pixelforge`. Keep the tunnel running. Use **Send test event** in Pixelforge's dashboard and check for HTTP 204 in its delivery history. The app's receipt should have type `ping` and status `processed` once the queue handles it.
+
+Generate with `[succeed] [duplicate]`, then `[fail] [duplicate]`. Both should finish normally. In the provider dashboard, resend an earlier processing event after completion: the generation and final charge should stay unchanged. Delivery attempts can increase while the local event row count stays one per unique event ID.
+
+The signing secret stays on the server. A missing secret returns HTTP 503; invalid or stale signatures return HTTP 400. An invalid signed event returns a non-success status for the provider to retry. These responses never create a charge.
+
+### 5. Run and explain the tests
+
+```bash
+php artisan test tests/Feature/PixelforgeWebhooksTest.php
+```
+
+Tests cover raw-body signatures, stale/future timestamps, duplicate deliveries, fresh signatures for old events, early callbacks, late processing events, zero-cost failures, polling/webhook overlap, unknown generations, and transaction rollback followed by retry. They run with a test signing secret and do not contact Pixelforge.
+
+For the interview: "The webhook endpoint authenticates and durably records the event before acknowledging it. The queued handler locks the receipt and generation, so receiving the same event twice does not apply it twice. Polling and webhooks use the same finalization service, and a terminal generation cannot move backward."
+
+Next checkpoint: deploy the app and queue worker publicly, configure a separate deployed API key and webhook secret, then reconcile deployed provider totals against `GET /v1/usage` before submission.

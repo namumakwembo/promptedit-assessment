@@ -95,7 +95,15 @@ class PixelforgeClient
     /** @return GenerationPayload */
     private function generation(Response $response): array
     {
-        $data = $this->decode($response);
+        return $this->parseGeneration($this->decode($response));
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return GenerationPayload
+     */
+    public function parseGeneration(array $data): array
+    {
 
         if (! is_string($data['id'] ?? null) || ! str_starts_with($data['id'], 'gen_')
             || ! in_array($data['status'] ?? null, ['queued', 'processing', 'succeeded', 'failed'], true)
